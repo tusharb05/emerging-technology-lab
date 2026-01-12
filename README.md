@@ -7,6 +7,10 @@
 - add new files
 - create new branches
 - create PR
+- understand forking 
+
+
+# Contributor:ayan
 - understand forking
 - git commands-Bashar
 - understanding conflicts-Rashi
