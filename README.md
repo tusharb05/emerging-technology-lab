@@ -12,3 +12,4 @@
 - understanding conflicts-Rashi
 -git vs GitHub 
 - making branches - Satya
+- creating conflicts - Kartikay
