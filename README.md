@@ -11,3 +11,4 @@
 - git commands-Bashar
 - understanding conflicts-Rashi
 -git vs GitHub 
+- making branches - Satya
