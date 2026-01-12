@@ -8,4 +8,5 @@
 - create new branches
 - create PR
 - understand forking
+- git commands-Bashar
 - understanding conflicts-Rashi
