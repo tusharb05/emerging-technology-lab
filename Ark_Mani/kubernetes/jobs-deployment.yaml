@@ -1,0 +1,106 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monte-carlo-simulation
+  namespace: portfolio-risk
+  labels:
+    app: simulation
+    type: monte-carlo
+spec:
+  parallelism: 10  # Run 10 pods in parallel
+  completions: 10   # Total number of completions needed
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600  # Clean up after 1 hour
+  template:
+    metadata:
+      labels:
+        app: simulation
+        type: monte-carlo
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: simulation-worker
+        image: portfolio-risk-backend:latest
+        command: ["python", "workers/simulation_worker.py"]
+        env:
+        - name: SIMULATION_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/2"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: portfolio-secrets
+              key: database-url
+        - name: NUM_PATHS
+          value: "1000"  # Each pod simulates 1000 paths
+        - name: PARALLEL_JOBS
+          value: "10"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: type
+                  operator: In
+                  values:
+                  - monte-carlo
+              topologyKey: kubernetes.io/hostname
+---
+# CronJob for scheduled portfolio rebalancing analysis
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-portfolio-analysis
+  namespace: portfolio-risk
+spec:
+  schedule: "0 2 * * *"  # Run at 2 AM daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: analysis-worker
+            image: portfolio-risk-backend:latest
+            command: ["python", "workers/scheduled_analysis.py"]
+            env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: portfolio-secrets
+                  key: database-url
+            - name: REDIS_URL
+              value: "redis://redis-service:6379/3"
+            - name: SEND_NOTIFICATIONS
+              value: "true"
+            resources:
+              requests:
+                memory: "1Gi"
+                cpu: "500m"
+              limits:
+                memory: "2Gi"
+                cpu: "1000m"
+---
+# ConfigMap for Job parameters
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simulation-config
+  namespace: portfolio-risk
+data:
+  paths_per_pod: "1000"
+  confidence_levels: "0.95,0.99"
+  time_horizons: "252,126,63"
+  rebalance_threshold: "0.05"
