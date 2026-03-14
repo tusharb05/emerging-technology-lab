@@ -1,0 +1,243 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: portfolio-postgres
+    environment:
+      POSTGRES_USER: portfolio_user
+      POSTGRES_PASSWORD: portfolio_pass
+      POSTGRES_DB: portfolio_risk
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfolio_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - portfolio-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: portfolio-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - portfolio-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portfolio-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://portfolio_user:portfolio_pass@postgres:5432/portfolio_risk
+      - REDIS_URL=redis://redis:6379/0
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - portfolio-network
+
+  # LLM Service (Separate for scaling)
+  llm-service:
+    build:
+      context: ./llm-service
+      dockerfile: Dockerfile
+    container_name: portfolio-llm
+    ports:
+      - "8001:8001"
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+      - MODEL_NAME=${MODEL_NAME:-EleutherAI/gpt-j-6B}
+      - REDIS_URL=redis://redis:6379/1
+    volumes:
+      - ./llm-service:/app
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - portfolio-network
+
+  # Risk Calculation Service
+  risk-calculator:
+    build:
+      context: ./risk-calculator
+      dockerfile: Dockerfile
+    container_name: portfolio-risk-calc
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://portfolio_user:portfolio_pass@postgres:5432/portfolio_risk
+      - REDIS_URL=redis://redis:6379/2
+    volumes:
+      - ./risk-calculator:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+    networks:
+      - portfolio-network
+
+  # Optimization Engine
+  optimizer:
+    build:
+      context: ./optimizer
+      dockerfile: Dockerfile
+    container_name: portfolio-optimizer
+    ports:
+      - "8003:8003"
+    environment:
+      - REDIS_URL=redis://redis:6379/3
+    volumes:
+      - ./optimizer:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
+    networks:
+      - portfolio-network
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portfolio-celery-worker
+    environment:
+      - DATABASE_URL=postgresql://portfolio_user:portfolio_pass@postgres:5432/portfolio_risk
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/4
+      - CELERY_RESULT_BACKEND=redis://redis:6379/4
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A tasks.celery_app worker --loglevel=info
+    networks:
+      - portfolio-network
+
+  # Celery Flower (Monitoring)
+  celery-flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portfolio-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/4
+      - CELERY_RESULT_BACKEND=redis://redis:6379/4
+    depends_on:
+      - celery-worker
+      - redis
+    command: celery -A tasks.celery_app flower --port=5555
+    networks:
+      - portfolio-network
+
+  # Streamlit Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: portfolio-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      - backend
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    networks:
+      - portfolio-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: portfolio-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - portfolio-network
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: portfolio-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - portfolio-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  portfolio-network:
+    driver: bridge
